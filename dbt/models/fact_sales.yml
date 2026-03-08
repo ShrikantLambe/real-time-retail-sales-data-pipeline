@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: fact_sales
+    description: >
+      Incremental fact table built from raw_retail_sales via a MERGE strategy
+      on TRANSACTION_ID. Adds a computed REVENUE column (QUANTITY * PRICE) and
+      serves as the primary analytics layer for retail sales reporting.
+      Grain: one row per unique transaction.
+    columns:
+      - name: TRANSACTION_ID
+        description: Globally unique UUID for the transaction. Primary key.
+        tests:
+          - unique
+          - not_null
+      - name: STORE_ID
+        description: Identifier for the store where the transaction occurred.
+        tests:
+          - not_null
+      - name: PRODUCT_ID
+        description: Identifier for the product sold.
+        tests:
+          - not_null
+      - name: QUANTITY
+        description: Number of units sold.
+        tests:
+          - not_null
+      - name: PRICE
+        description: Unit price of the product at time of sale.
+        tests:
+          - not_null
+      - name: PAYMENT_TYPE
+        description: Payment method used.
+        tests:
+          - accepted_values:
+              values: ['credit_card', 'debit_card', 'cash', 'online']
+      - name: TRANSACTION_TS
+        description: UTC timestamp of the transaction.
+        tests:
+          - not_null
+      - name: REVENUE
+        description: Computed total revenue for the transaction (QUANTITY * PRICE).
+        tests:
+          - not_null

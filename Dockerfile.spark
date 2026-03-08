@@ -1,0 +1,35 @@
+FROM apache/spark:3.5.0
+
+# Pre-download all required Spark packages into the Ivy cache at build time.
+# This eliminates runtime Maven resolution on every container restart and
+# prevents failures due to transient network issues or missing package versions.
+#
+# Package versions:
+#   spark-sql-kafka-0-10_2.12 : Kafka source/sink for Spark Structured Streaming
+#   spark-snowflake_2.12 3.1.7: Snowflake Spark connector (v3.x, no Spark suffix)
+#   snowflake-jdbc 3.15.1     : Snowflake JDBC driver (required by the connector)
+
+USER root
+
+RUN mkdir -p /tmp/.ivy2
+
+# Write a minimal no-op PySpark script. spark-submit resolves --packages
+# before starting Python, so the Ivy cache is populated even from this stub.
+RUN echo "from pyspark.sql import SparkSession; SparkSession.builder.getOrCreate().stop()" \
+    > /tmp/noop.py
+
+# Run spark-submit with --master local so no cluster is needed at build time.
+# Packages are resolved from Maven Central and cached in /tmp/.ivy2.
+# chmod AFTER the download so that all files created by spark-submit (root-owned
+# by default) are world-writable — the spark user needs to write resolution
+# descriptor files on every runtime invocation.
+RUN /opt/spark/bin/spark-submit \
+      --master local[1] \
+      --conf spark.jars.ivy=/tmp/.ivy2 \
+      --repositories https://repo1.maven.org/maven2 \
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,net.snowflake:spark-snowflake_2.12:3.1.7,net.snowflake:snowflake-jdbc:3.15.1 \
+      /tmp/noop.py && \
+    rm /tmp/noop.py && \
+    chmod -R 777 /tmp/.ivy2
+
+USER spark

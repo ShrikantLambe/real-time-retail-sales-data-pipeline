@@ -1,0 +1,45 @@
+version: 2
+
+sources:
+  - name: streaming
+    description: >
+      Raw and aggregated retail sales data written to Snowflake by the
+      PySpark Structured Streaming job.
+    database: RETAIL_DB
+    schema: STREAMING
+    tables:
+      - name: RAW_RETAIL_SALES
+        description: >
+          Transaction-level retail sales events, deduplicated by transaction_id
+          and ingested in micro-batches from the Kafka retail_sales topic.
+        columns:
+          - name: TRANSACTION_ID
+            description: Globally unique UUID for each sales transaction.
+          - name: STORE_ID
+            description: Identifier for the store where the transaction occurred.
+          - name: PRODUCT_ID
+            description: Identifier for the product sold.
+          - name: QUANTITY
+            description: Number of units sold in the transaction.
+          - name: PRICE
+            description: Unit price of the product at time of sale.
+          - name: PAYMENT_TYPE
+            description: Payment method (credit_card, debit_card, cash, online).
+          - name: TRANSACTION_TS
+            description: UTC timestamp when the transaction occurred.
+
+      - name: AGG_STORE_SALES_5MIN
+        description: >
+          5-minute windowed aggregations of sales revenue and quantity, grouped
+          by store. Populated by the PySpark streaming job.
+        columns:
+          - name: WINDOW_START
+            description: Start of the 5-minute aggregation window (UTC).
+          - name: WINDOW_END
+            description: End of the 5-minute aggregation window (UTC).
+          - name: STORE_ID
+            description: Identifier for the store.
+          - name: TOTAL_REVENUE
+            description: Sum of (quantity * price) for all transactions in the window.
+          - name: TOTAL_QUANTITY
+            description: Sum of units sold across all transactions in the window.

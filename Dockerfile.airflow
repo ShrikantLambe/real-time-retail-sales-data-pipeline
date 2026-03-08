@@ -1,0 +1,10 @@
+FROM apache/airflow:2.7.1
+
+USER airflow
+# Single pip install pass — reduces image layers and speeds up builds.
+# apache-airflow-providers-snowflake supplies SnowflakeHook used by the DAG.
+RUN pip install --no-cache-dir \
+    kafka-python==2.0.2 \
+    dbt-core==1.7.9 \
+    dbt-snowflake==1.7.4 \
+    apache-airflow-providers-snowflake==5.2.1

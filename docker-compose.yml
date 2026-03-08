@@ -1,0 +1,237 @@
+# Docker Compose for Real-Time Retail Sales Data Pipeline
+# Includes Kafka, Zookeeper, Spark, Airflow, and Postgres
+
+# Shared Airflow environment block — avoids repeating credentials across three services.
+x-airflow-common-env: &airflow-common-env
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY}"
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  # Snowflake credentials — sourced from .env, never hardcoded here.
+  SNOWFLAKE_ACCOUNT: "${SNOWFLAKE_ACCOUNT}"
+  SNOWFLAKE_USER: "${SNOWFLAKE_USER}"
+  SNOWFLAKE_PASSWORD: "${SNOWFLAKE_PASSWORD}"
+  SNOWFLAKE_DATABASE: "${SNOWFLAKE_DATABASE}"
+  SNOWFLAKE_SCHEMA: "${SNOWFLAKE_SCHEMA}"
+  SNOWFLAKE_WAREHOUSE: "${SNOWFLAKE_WAREHOUSE}"
+  SNOWFLAKE_ROLE: "${SNOWFLAKE_ROLE}"
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "${KAFKA_TOPIC}"
+  # Airflow Snowflake connection — auto-registered, no UI setup required.
+  AIRFLOW_CONN_SNOWFLAKE_DEFAULT: "${AIRFLOW_CONN_SNOWFLAKE_DEFAULT}"
+
+x-airflow-common-volumes: &airflow-common-volumes
+  - ./airflow-dags:/opt/airflow/dags
+  - airflow_logs:/opt/airflow/logs
+  - ./monitoring:/opt/airflow/monitoring
+  - ./kafka-producer:/opt/airflow/kafka-producer
+  - ./dbt:/opt/airflow/dbt
+  - ./dbt/profiles.yml:/home/airflow/.dbt/profiles.yml
+
+services:
+  # Zookeeper for Kafka coordination
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Kafka broker for event streaming
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Spark master
+  spark:
+    image: apache/spark:3.5.0
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - spark_data:/opt/spark/work
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Spark worker — executes tasks dispatched by the Spark master.
+  # At least one worker must be registered before spark-streaming can run jobs.
+  spark-worker:
+    image: apache/spark:3.5.0
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
+    environment:
+      - SPARK_WORKER_MEMORY=1g
+      - SPARK_WORKER_CORES=2
+    depends_on:
+      spark:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Spark streaming job — long-lived service managed here, not triggered by Airflow.
+  # Built from Dockerfile.spark which pre-warms the Ivy cache at image build time,
+  # so all packages are available locally without runtime Maven resolution.
+  # Snowflake credentials come from .env via ${VAR} expansion.
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    depends_on:
+      spark:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_TOPIC=${KAFKA_TOPIC}
+      - CHECKPOINT_DIR=${CHECKPOINT_DIR}
+      - KAFKA_STARTING_OFFSETS=earliest
+      - SNOWFLAKE_URL=${SNOWFLAKE_URL}
+      - SNOWFLAKE_USER=${SNOWFLAKE_USER}
+      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD}
+      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE}
+      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA}
+      - SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE}
+      - SNOWFLAKE_ROLE=${SNOWFLAKE_ROLE}
+    volumes:
+      - ./spark-streaming:/spark-streaming
+    restart: unless-stopped
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark:7077
+      --conf spark.jars.ivy=/tmp/.ivy2
+      --repositories https://repo1.maven.org/maven2
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,net.snowflake:spark-snowflake_2.12:3.1.7,net.snowflake:snowflake-jdbc:3.15.1
+      /spark-streaming/stream_processor.py
+
+  # Postgres for Airflow metadata
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # One-shot init job to bootstrap Airflow metadata DB + admin user.
+  # webserver and scheduler must wait for this to complete successfully.
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    volumes: *airflow-common-volumes
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create \
+          --username airflow \
+          --password airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email airflow@example.com || true
+
+  # Airflow webserver — waits for airflow-init to complete before starting.
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-scheduler:
+        condition: service_started
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW__WEBSERVER__PORT: 8080
+      AIRFLOW__WEBSERVER__WORKERS: 1
+    ports:
+      - "8080:8080"
+    volumes: *airflow-common-volumes
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    command: webserver
+
+  # Airflow scheduler — waits for DB init before starting.
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+    volumes: *airflow-common-volumes
+    restart: unless-stopped
+    command: scheduler
+
+# Volumes for persistence
+volumes:
+  zookeeper_data:
+  kafka_data:
+  spark_data:
+  postgres_data:
+  airflow_logs:
