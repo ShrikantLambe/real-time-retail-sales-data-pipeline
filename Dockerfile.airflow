@@ -2,9 +2,12 @@ FROM apache/airflow:2.7.1
 
 USER airflow
 # Single pip install pass — reduces image layers and speeds up builds.
-# apache-airflow-providers-snowflake supplies SnowflakeHook used by the DAG.
+# confluent-kafka replaces kafka-python: Avro + Schema Registry support.
+# requests is used by the Slack alerting helper in the DAG.
 RUN pip install --no-cache-dir \
-    kafka-python==2.0.2 \
+    confluent-kafka==2.3.0 \
+    "confluent-kafka[avro]==2.3.0" \
+    requests==2.31.0 \
     dbt-core==1.7.9 \
     dbt-snowflake==1.7.4 \
     apache-airflow-providers-snowflake==5.2.1

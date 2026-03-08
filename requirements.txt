@@ -3,7 +3,9 @@
 # install packages directly). Install here for IDE support and local testing:
 #   python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
-kafka-python==2.0.2
+confluent-kafka==2.3.0
+confluent-kafka[avro]==2.3.0
+requests==2.31.0
 dbt-core==1.7.9
 dbt-snowflake==1.7.4
 apache-airflow-providers-snowflake==5.2.1

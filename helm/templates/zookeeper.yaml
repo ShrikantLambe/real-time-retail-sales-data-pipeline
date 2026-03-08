@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zookeeper
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  serviceName: zookeeper
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "zookeeper") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "zookeeper") | nindent 8 }}
+    spec:
+      containers:
+        - name: zookeeper
+          image: {{ .Values.images.zookeeper }}
+          env:
+            - name: ZOOKEEPER_CLIENT_PORT
+              value: "2181"
+            - name: ZOOKEEPER_TICK_TIME
+              value: "2000"
+          ports:
+            - containerPort: 2181
+          livenessProbe:
+            tcpSocket:
+              port: 2181
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/zookeeper
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.storage.zookeeper }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zookeeper
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "zookeeper") | nindent 4 }}
+  ports:
+    - port: 2181
+      name: client

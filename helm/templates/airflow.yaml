@@ -1,0 +1,161 @@
+# Airflow init Job — runs once to bootstrap the metadata DB and admin user.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: airflow-init
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: airflow-init
+          image: {{ .Values.images.airflow.repository }}:{{ .Values.images.airflow.tag }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              airflow db init
+              airflow users create \
+                --username airflow \
+                --password airflow \
+                --firstname Airflow \
+                --lastname Admin \
+                --role Admin \
+                --email airflow@example.com || true
+          envFrom:
+            - configMapRef:
+                name: {{ include "retail-pipeline.name" . }}-config
+            - secretRef:
+                name: {{ include "retail-pipeline.name" . }}-secrets
+          env:
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: "postgresql+psycopg2://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@postgres:5432/{{ .Values.postgres.db }}"
+            - name: AIRFLOW__CORE__EXECUTOR
+              value: LocalExecutor
+            - name: AIRFLOW__CORE__LOAD_EXAMPLES
+              value: "false"
+---
+# Airflow scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "airflow-scheduler") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "airflow-scheduler") | nindent 8 }}
+    spec:
+      containers:
+        - name: scheduler
+          image: {{ .Values.images.airflow.repository }}:{{ .Values.images.airflow.tag }}
+          command: ["airflow", "scheduler"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "retail-pipeline.name" . }}-config
+            - secretRef:
+                name: {{ include "retail-pipeline.name" . }}-secrets
+          env:
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: "postgresql+psycopg2://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@postgres:5432/{{ .Values.postgres.db }}"
+            - name: AIRFLOW__CORE__EXECUTOR
+              value: LocalExecutor
+            - name: AIRFLOW__CORE__LOAD_EXAMPLES
+              value: "false"
+          resources:
+            {{- toYaml .Values.airflow.resources | nindent 12 }}
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+            - name: logs
+              mountPath: /opt/airflow/logs
+      volumes:
+        - name: dags
+          configMap:
+            name: {{ include "retail-pipeline.name" . }}-dags
+        - name: logs
+          emptyDir: {}
+---
+# Airflow webserver
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "airflow-webserver") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "airflow-webserver") | nindent 8 }}
+    spec:
+      containers:
+        - name: webserver
+          image: {{ .Values.images.airflow.repository }}:{{ .Values.images.airflow.tag }}
+          command: ["airflow", "webserver"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "retail-pipeline.name" . }}-config
+            - secretRef:
+                name: {{ include "retail-pipeline.name" . }}-secrets
+          env:
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: "postgresql+psycopg2://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@postgres:5432/{{ .Values.postgres.db }}"
+            - name: AIRFLOW__CORE__EXECUTOR
+              value: LocalExecutor
+            - name: AIRFLOW__CORE__LOAD_EXAMPLES
+              value: "false"
+            - name: AIRFLOW__WEBSERVER__PORT
+              value: {{ .Values.airflow.webserver.port | quote }}
+          ports:
+            - containerPort: {{ .Values.airflow.webserver.port }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.airflow.webserver.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.airflow.resources | nindent 12 }}
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+            - name: logs
+              mountPath: /opt/airflow/logs
+      volumes:
+        - name: dags
+          configMap:
+            name: {{ include "retail-pipeline.name" . }}-dags
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-webserver
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "airflow-webserver") | nindent 4 }}
+  ports:
+    - port: {{ .Values.airflow.webserver.port }}
+      targetPort: {{ .Values.airflow.webserver.port }}
+      name: http
+  type: ClusterIP

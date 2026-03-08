@@ -3,8 +3,9 @@ Production-grade Airflow DAG for retail streaming pipeline.
 """
 import logging
 import os
+import requests
 from datetime import timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -19,6 +20,7 @@ class DAGConfig:
         self.schedule = os.getenv('DAG_SCHEDULE', '*/10 * * * *')
         self.snowflake_conn_id = os.getenv('SNOWFLAKE_CONN_ID', 'snowflake_default')
         self.dbt_dir = os.getenv('DBT_DIR', '/opt/airflow/dbt')
+        self.slack_webhook_url: Optional[str] = os.getenv('SLACK_WEBHOOK_URL')
 
 
 class StructuredLogger:
@@ -40,10 +42,38 @@ class StructuredLogger:
         logging.warning(message)
 
 
+def _send_slack_alert(message: str) -> None:
+    """POST a message to the Slack incoming webhook configured in SLACK_WEBHOOK_URL.
+
+    No-ops silently if the env var is not set (keeps the DAG portable across
+    environments that have not yet configured Slack).
+    """
+    webhook_url = DAGConfig().slack_webhook_url
+    if not webhook_url:
+        logging.warning('SLACK_WEBHOOK_URL not configured — skipping Slack notification.')
+        return
+    payload = {
+        'text': f':warning: *Retail Pipeline Alert*\n{message}',
+        'username': 'Airflow Quality Bot',
+        'icon_emoji': ':robot_face:',
+    }
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        logging.info('Slack alert sent successfully.')
+    except requests.RequestException as exc:
+        logging.error(f'Slack alert failed (non-blocking): {exc}')
+
+
 def task_failure_callback(context: Dict[str, Any]) -> None:
-    """Failure callback — logs and can be extended with Slack/PagerDuty alerting."""
+    """Failure callback — logs the failure and fires a Slack alert."""
     StructuredLogger.log_failure(context)
-    # TODO: hook in Slack/email/PagerDuty here
+    task_id = context['task_instance'].task_id
+    dag_id = context['dag'].dag_id
+    run_id = context['run_id']
+    _send_slack_alert(
+        f'Task `{task_id}` in DAG `{dag_id}` failed.\nRun ID: `{run_id}`'
+    )
 
 
 def validate_snowflake_conn(**kwargs) -> bool:
@@ -62,6 +92,11 @@ def run_data_quality_checks(**kwargs) -> str:
     """
     Execute all data quality checks against Snowflake and return a pass/fail summary.
     Result is pushed to XCom for the downstream alert task.
+
+    Anomaly detection uses a 3-sigma (Z-score) model trained on the rolling 7-day
+    hourly history, replacing the naive ±50% static threshold.  Flags are raised
+    only when the current value deviates more than 3 standard deviations from the
+    historical mean — robust to seasonal ramp-ups and cold-start periods.
     """
     from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
@@ -98,62 +133,98 @@ def run_data_quality_checks(**kwargs) -> str:
     if dup_row[0] == 'FAIL':
         failures.append(f"duplicate_check FAIL: {dup_row[1]} duplicate transaction_ids")
 
-    # 3. Volume anomaly: last 1 hr vs avg of previous 24 hrs (±50%).
-    #    Guard against division-by-zero on first run (prev_24hr.volume = 0).
+    # 3. Volume anomaly — 3-sigma Z-score over rolling 7-day hourly history.
+    #    PASS when: no history yet (cold start), σ = 0 (perfectly flat), or |Z| ≤ 3.
     vol_row = hook.get_first("""
-        WITH last_hour AS (
+        WITH hourly_history AS (
+            SELECT
+                DATE_TRUNC('hour', transaction_ts) AS hr,
+                COUNT(*) AS volume
+            FROM RETAIL_DB.STREAMING.raw_retail_sales
+            WHERE transaction_ts >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+              AND transaction_ts <  DATEADD('hour', -1, CURRENT_TIMESTAMP())
+            GROUP BY 1
+        ),
+        stats AS (
+            SELECT
+                AVG(volume)    AS mu,
+                STDDEV(volume) AS sigma
+            FROM hourly_history
+        ),
+        current_hour AS (
             SELECT COUNT(*) AS volume
             FROM RETAIL_DB.STREAMING.raw_retail_sales
             WHERE transaction_ts >= DATEADD('hour', -1, CURRENT_TIMESTAMP())
-        ),
-        prev_24hr AS (
-            SELECT COUNT(*) AS volume
-            FROM RETAIL_DB.STREAMING.raw_retail_sales
-            WHERE transaction_ts < DATEADD('hour', -1, CURRENT_TIMESTAMP())
-              AND transaction_ts >= DATEADD('hour', -25, CURRENT_TIMESTAMP())
         )
         SELECT
             CASE
-                WHEN p24.volume = 0 THEN 'PASS'
-                WHEN lh.volume BETWEEN (p24.volume / 24) * 0.5
-                                   AND (p24.volume / 24) * 1.5 THEN 'PASS'
+                WHEN s.sigma IS NULL OR s.sigma = 0 THEN 'PASS'
+                WHEN ABS(c.volume - s.mu) <= 3 * s.sigma THEN 'PASS'
                 ELSE 'FAIL'
             END,
-            lh.volume         AS last_hour_volume,
-            (p24.volume / 24) AS avg_hourly_volume
-        FROM last_hour lh, prev_24hr p24
+            c.volume                                                    AS current_volume,
+            ROUND(s.mu, 1)                                              AS mean_volume,
+            ROUND(s.sigma, 1)                                           AS stddev_volume,
+            CASE WHEN s.sigma > 0
+                 THEN ROUND((c.volume - s.mu) / s.sigma, 2)
+                 ELSE 0 END                                             AS z_score
+        FROM current_hour c, stats s
     """)
-    logging.info(f"volume_anomaly: status={vol_row[0]}, last_hour={vol_row[1]}, avg_hourly={vol_row[2]}")
+    logging.info(
+        f"volume_anomaly: status={vol_row[0]}, current={vol_row[1]}, "
+        f"mean={vol_row[2]}, sigma={vol_row[3]}, z={vol_row[4]}"
+    )
     if vol_row[0] == 'FAIL':
-        failures.append(f"volume_anomaly FAIL: last_hour={vol_row[1]}, avg_hourly={vol_row[2]}")
+        failures.append(
+            f"volume_anomaly FAIL: current={vol_row[1]}, "
+            f"mean={vol_row[2]}, sigma={vol_row[3]}, z_score={vol_row[4]}"
+        )
 
-    # 4. Revenue anomaly: same ±50% window, guarded against NULL/zero baseline.
+    # 4. Revenue anomaly — same 3-sigma model applied to hourly revenue.
     rev_row = hook.get_first("""
-        WITH last_hour AS (
+        WITH hourly_history AS (
+            SELECT
+                DATE_TRUNC('hour', transaction_ts) AS hr,
+                SUM(quantity * price) AS revenue
+            FROM RETAIL_DB.STREAMING.raw_retail_sales
+            WHERE transaction_ts >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+              AND transaction_ts <  DATEADD('hour', -1, CURRENT_TIMESTAMP())
+            GROUP BY 1
+        ),
+        stats AS (
+            SELECT
+                AVG(revenue)    AS mu,
+                STDDEV(revenue) AS sigma
+            FROM hourly_history
+        ),
+        current_hour AS (
             SELECT SUM(quantity * price) AS revenue
             FROM RETAIL_DB.STREAMING.raw_retail_sales
             WHERE transaction_ts >= DATEADD('hour', -1, CURRENT_TIMESTAMP())
-        ),
-        prev_24hr AS (
-            SELECT SUM(quantity * price) AS revenue
-            FROM RETAIL_DB.STREAMING.raw_retail_sales
-            WHERE transaction_ts < DATEADD('hour', -1, CURRENT_TIMESTAMP())
-              AND transaction_ts >= DATEADD('hour', -25, CURRENT_TIMESTAMP())
         )
         SELECT
             CASE
-                WHEN p24.revenue IS NULL OR p24.revenue = 0 THEN 'PASS'
-                WHEN lh.revenue BETWEEN (p24.revenue / 24) * 0.5
-                                    AND (p24.revenue / 24) * 1.5 THEN 'PASS'
+                WHEN s.sigma IS NULL OR s.sigma = 0 THEN 'PASS'
+                WHEN ABS(COALESCE(c.revenue, 0) - s.mu) <= 3 * s.sigma THEN 'PASS'
                 ELSE 'FAIL'
             END,
-            lh.revenue         AS last_hour_revenue,
-            (p24.revenue / 24) AS avg_hourly_revenue
-        FROM last_hour lh, prev_24hr p24
+            ROUND(COALESCE(c.revenue, 0), 2)                            AS current_revenue,
+            ROUND(s.mu, 2)                                              AS mean_revenue,
+            ROUND(s.sigma, 2)                                           AS stddev_revenue,
+            CASE WHEN s.sigma > 0
+                 THEN ROUND((COALESCE(c.revenue, 0) - s.mu) / s.sigma, 2)
+                 ELSE 0 END                                             AS z_score
+        FROM current_hour c, stats s
     """)
-    logging.info(f"revenue_anomaly: status={rev_row[0]}, last_hour={rev_row[1]}, avg_hourly={rev_row[2]}")
+    logging.info(
+        f"revenue_anomaly: status={rev_row[0]}, current={rev_row[1]}, "
+        f"mean={rev_row[2]}, sigma={rev_row[3]}, z={rev_row[4]}"
+    )
     if rev_row[0] == 'FAIL':
-        failures.append(f"revenue_anomaly FAIL: last_hour={rev_row[1]}, avg_hourly={rev_row[2]}")
+        failures.append(
+            f"revenue_anomaly FAIL: current={rev_row[1]}, "
+            f"mean={rev_row[2]}, sigma={rev_row[3]}, z_score={rev_row[4]}"
+        )
 
     if failures:
         return 'FAIL: ' + ' | '.join(failures)
@@ -161,12 +232,12 @@ def run_data_quality_checks(**kwargs) -> str:
 
 
 def alert_if_quality_fails(**kwargs) -> str:
-    """Trigger alert if any data quality check returned FAIL."""
+    """Fire a Slack alert if any data quality check returned FAIL."""
     ti = kwargs['ti']
     dq_result = ti.xcom_pull(task_ids='run_data_quality_checks')
     if dq_result and 'FAIL' in str(dq_result):
         StructuredLogger.log_alert(f'Data quality check failed: {dq_result}')
-        # TODO: send Slack/email/PagerDuty notification
+        _send_slack_alert(f'*Data quality checks failed*\n```{dq_result}```')
         return 'ALERT_SENT'
     logging.info('Data quality check passed.')
     return 'NO_ALERT'
@@ -188,10 +259,12 @@ def check_streaming_health(**kwargs) -> None:
     count = row[0] if row else 0
     logging.info(f"Records written to Snowflake in the last 15 minutes: {count}")
     if count == 0:
-        logging.warning(
-            "No records in raw_retail_sales for the past 15 minutes. "
-            "Verify spark-streaming container is running: docker compose ps"
+        msg = (
+            'No records in raw_retail_sales for the past 15 minutes. '
+            'Verify spark-streaming container is running: docker compose ps'
         )
+        logging.warning(msg)
+        _send_slack_alert(f':warning: Spark streaming health check: {msg}')
 
 
 StructuredLogger.setup()
@@ -223,7 +296,6 @@ with DAG(
     )
 
     # Produce 25 synthetic retail events to Kafka.
-    # Credentials come from the container environment (docker-compose / .env).
     run_kafka_producer = BashOperator(
         task_id='run_kafka_producer',
         bash_command='python3 /opt/airflow/kafka-producer/producer.py',
@@ -253,7 +325,7 @@ with DAG(
         execution_timeout=timedelta(minutes=10),
     )
 
-    # Alert if any check failed.
+    # Alert via Slack if any check failed.
     send_alert = PythonOperator(
         task_id='send_alert_if_quality_fails',
         python_callable=alert_if_quality_fails,

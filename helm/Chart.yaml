@@ -1,0 +1,17 @@
+apiVersion: v2
+name: retail-pipeline
+description: >
+  Real-Time Retail Sales Data Pipeline — Kafka → Spark → Snowflake → dbt → Airflow.
+  Includes Schema Registry, Superset, and Postgres.
+type: application
+version: 1.0.0
+appVersion: "1.0"
+keywords:
+  - kafka
+  - spark
+  - snowflake
+  - airflow
+  - dbt
+  - streaming
+maintainers:
+  - name: Data Engineering Team

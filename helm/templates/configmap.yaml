@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "retail-pipeline.name" . }}-config
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+data:
+  KAFKA_TOPIC:           {{ .Values.kafka.topic | quote }}
+  KAFKA_BROKERS:         "kafka:9092"
+  SCHEMA_REGISTRY_URL:   "http://schema-registry:8081"
+  SNOWFLAKE_DATABASE:    {{ .Values.snowflake.database | quote }}
+  SNOWFLAKE_SCHEMA:      {{ .Values.snowflake.schema | quote }}
+  SNOWFLAKE_WAREHOUSE:   {{ .Values.snowflake.warehouse | quote }}
+  SNOWFLAKE_ROLE:        {{ .Values.snowflake.role | quote }}
+  DAG_SCHEDULE:          {{ .Values.airflow.dagSchedule | quote }}
+  SNOWFLAKE_CONN_ID:     {{ .Values.airflow.snowflakeConnId | quote }}
+  CHECKPOINT_DIR:        {{ .Values.spark.streaming.checkpointDir | quote }}
+  DBT_DIR:               "/opt/airflow/dbt"

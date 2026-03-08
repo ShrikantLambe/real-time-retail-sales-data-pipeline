@@ -1,0 +1,95 @@
+# Default values for retail-pipeline Helm chart.
+# Override per environment with:
+#   helm install retail-pipeline ./helm -f helm/values-prod.yaml
+
+# ── Images ──────────────────────────────────────────────────────────────────
+images:
+  zookeeper:       confluentinc/cp-zookeeper:7.4.0
+  kafka:           confluentinc/cp-kafka:7.4.0
+  schemaRegistry:  confluentinc/cp-schema-registry:7.4.0
+  spark:           apache/spark:3.5.0
+  postgres:        postgres:15
+  airflow:         # built from Dockerfile.airflow; push to your registry
+    repository: your-registry/retail-airflow
+    tag: latest
+  sparkStreaming:  # built from Dockerfile.spark
+    repository: your-registry/retail-spark-streaming
+    tag: latest
+  superset:        # built from Dockerfile.superset
+    repository: your-registry/retail-superset
+    tag: latest
+
+# ── Replicas ─────────────────────────────────────────────────────────────────
+replicaCount:
+  sparkWorker: 2
+
+# ── Kafka ────────────────────────────────────────────────────────────────────
+kafka:
+  topic: retail_sales
+  replicationFactor: 1
+  partitions: 3
+
+# ── Snowflake ─────────────────────────────────────────────────────────────────
+# All values are injected from a Kubernetes Secret (see templates/secrets.yaml).
+# Do NOT put real credentials in this file.
+snowflake:
+  account: ""
+  user: ""
+  database: RETAIL_DB
+  schema: STREAMING
+  warehouse: RETAIL_WH
+  role: DATA_ENGINEER
+
+# ── Airflow ───────────────────────────────────────────────────────────────────
+airflow:
+  fernetKey: ""          # generate with Fernet.generate_key()
+  dagSchedule: "*/10 * * * *"
+  snowflakeConnId: snowflake_default
+  webserver:
+    port: 8080
+    workers: 2
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+
+# ── Spark ─────────────────────────────────────────────────────────────────────
+spark:
+  worker:
+    memory: "2g"
+    cores: 2
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+  streaming:
+    checkpointDir: /tmp/spark_checkpoint
+    startingOffsets: latest
+
+# ── Superset ──────────────────────────────────────────────────────────────────
+superset:
+  secretKey: ""          # generate with: openssl rand -base64 42
+  port: 8088
+
+# ── Postgres ─────────────────────────────────────────────────────────────────
+postgres:
+  user: airflow
+  password: airflow   # override in production
+  db: airflow
+  storage: 10Gi
+
+# ── Slack ─────────────────────────────────────────────────────────────────────
+slack:
+  webhookUrl: ""         # set to your Incoming Webhook URL
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+storage:
+  zookeeper: 5Gi
+  kafka: 20Gi
+  airflowLogs: 10Gi

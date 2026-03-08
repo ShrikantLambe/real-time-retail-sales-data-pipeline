@@ -1,0 +1,120 @@
+# Spark master
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-master
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-master") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-master") | nindent 8 }}
+    spec:
+      containers:
+        - name: spark-master
+          image: {{ .Values.images.spark }}
+          command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+          env:
+            - name: SPARK_MODE
+              value: master
+            - name: SPARK_MASTER_HOST
+              value: spark-master
+          ports:
+            - containerPort: 7077
+              name: spark
+            - containerPort: 8080
+              name: ui
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-master
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-master") | nindent 4 }}
+  ports:
+    - port: 7077
+      name: spark
+    - port: 8080
+      name: ui
+---
+# Spark workers — horizontally scalable via replicaCount.sparkWorker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-worker
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount.sparkWorker }}
+  selector:
+    matchLabels:
+      {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-worker") | nindent 8 }}
+    spec:
+      containers:
+        - name: spark-worker
+          image: {{ .Values.images.spark }}
+          command:
+            - /opt/spark/bin/spark-class
+            - org.apache.spark.deploy.worker.Worker
+            - spark://spark-master:7077
+          env:
+            - name: SPARK_WORKER_MEMORY
+              value: {{ .Values.spark.worker.memory | quote }}
+            - name: SPARK_WORKER_CORES
+              value: {{ .Values.spark.worker.cores | quote }}
+          resources:
+            {{- toYaml .Values.spark.worker.resources | nindent 12 }}
+---
+# Spark streaming job — long-lived deployment using the pre-built image
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-streaming
+  labels:
+    {{- include "retail-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-streaming") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "retail-pipeline.selectorLabels" (dict "root" . "component" "spark-streaming") | nindent 8 }}
+    spec:
+      containers:
+        - name: spark-streaming
+          image: {{ .Values.images.sparkStreaming.repository }}:{{ .Values.images.sparkStreaming.tag }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "retail-pipeline.name" . }}-config
+            - secretRef:
+                name: {{ include "retail-pipeline.name" . }}-secrets
+          command:
+            - /opt/spark/bin/spark-submit
+            - --master
+            - spark://spark-master:7077
+            - --conf
+            - spark.jars.ivy=/tmp/.ivy2
+            - --packages
+            - "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.spark:spark-avro_2.12:3.5.0,net.snowflake:spark-snowflake_2.12:3.1.7,net.snowflake:snowflake-jdbc:3.15.1"
+            - /spark-streaming/stream_processor.py
+          restartPolicy: Always

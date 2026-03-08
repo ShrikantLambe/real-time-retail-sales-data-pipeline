@@ -6,6 +6,7 @@ FROM apache/spark:3.5.0
 #
 # Package versions:
 #   spark-sql-kafka-0-10_2.12 : Kafka source/sink for Spark Structured Streaming
+#   spark-avro_2.12 3.5.0     : Avro deserialization (from_avro) for Confluent wire format
 #   spark-snowflake_2.12 3.1.7: Snowflake Spark connector (v3.x, no Spark suffix)
 #   snowflake-jdbc 3.15.1     : Snowflake JDBC driver (required by the connector)
 

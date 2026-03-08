@@ -1,5 +1,5 @@
 # Docker Compose for Real-Time Retail Sales Data Pipeline
-# Includes Kafka, Zookeeper, Spark, Airflow, and Postgres
+# Services: Zookeeper, Kafka, Schema Registry, Spark, Airflow, Postgres, Superset
 
 # Shared Airflow environment block — avoids repeating credentials across three services.
 x-airflow-common-env: &airflow-common-env
@@ -17,6 +17,8 @@ x-airflow-common-env: &airflow-common-env
   SNOWFLAKE_ROLE: "${SNOWFLAKE_ROLE}"
   KAFKA_BROKERS: "kafka:9092"
   KAFKA_TOPIC: "${KAFKA_TOPIC}"
+  SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+  SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
   # Airflow Snowflake connection — auto-registered, no UI setup required.
   AIRFLOW_CONN_SNOWFLAKE_DEFAULT: "${AIRFLOW_CONN_SNOWFLAKE_DEFAULT}"
 
@@ -29,7 +31,7 @@ x-airflow-common-volumes: &airflow-common-volumes
   - ./dbt/profiles.yml:/home/airflow/.dbt/profiles.yml
 
 services:
-  # Zookeeper for Kafka coordination
+  # ── Zookeeper ──────────────────────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     environment:
@@ -46,7 +48,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Kafka broker for event streaming
+  # ── Kafka ──────────────────────────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     depends_on:
@@ -70,7 +72,29 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Spark master
+  # ── Schema Registry ────────────────────────────────────────────────────────
+  # Stores and versions Avro schemas; the producer registers on first run.
+  # Spark reads the embedded schema string directly (no live Registry call),
+  # keeping the streaming job decoupled from Registry availability.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    ports:
+      - "8082:8081"   # host:8082 → container:8081 (avoids collision with Spark UI)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/ > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Spark master ───────────────────────────────────────────────────────────
   spark:
     image: apache/spark:3.5.0
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
@@ -92,7 +116,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Spark worker — executes tasks dispatched by the Spark master.
+  # ── Spark worker ───────────────────────────────────────────────────────────
   # At least one worker must be registered before spark-streaming can run jobs.
   spark-worker:
     image: apache/spark:3.5.0
@@ -105,10 +129,9 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # Spark streaming job — long-lived service managed here, not triggered by Airflow.
-  # Built from Dockerfile.spark which pre-warms the Ivy cache at image build time,
-  # so all packages are available locally without runtime Maven resolution.
-  # Snowflake credentials come from .env via ${VAR} expansion.
+  # ── Spark streaming job ────────────────────────────────────────────────────
+  # Long-lived service managed here, not triggered by Airflow.
+  # Dockerfile.spark pre-warms the Ivy cache (spark-avro included) at build time.
   spark-streaming:
     build:
       context: .
@@ -117,6 +140,8 @@ services:
       spark:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      schema-registry:
         condition: service_healthy
     environment:
       - KAFKA_BROKERS=kafka:9092
@@ -138,10 +163,10 @@ services:
       --master spark://spark:7077
       --conf spark.jars.ivy=/tmp/.ivy2
       --repositories https://repo1.maven.org/maven2
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,net.snowflake:spark-snowflake_2.12:3.1.7,net.snowflake:snowflake-jdbc:3.15.1
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.spark:spark-avro_2.12:3.5.0,net.snowflake:spark-snowflake_2.12:3.1.7,net.snowflake:snowflake-jdbc:3.15.1
       /spark-streaming/stream_processor.py
 
-  # Postgres for Airflow metadata
+  # ── Postgres — Airflow metadata ────────────────────────────────────────────
   postgres:
     image: postgres:15
     environment:
@@ -159,8 +184,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # One-shot init job to bootstrap Airflow metadata DB + admin user.
-  # webserver and scheduler must wait for this to complete successfully.
+  # ── Airflow init ───────────────────────────────────────────────────────────
   airflow-init:
     build:
       context: .
@@ -185,7 +209,7 @@ services:
           --role Admin \
           --email airflow@example.com || true
 
-  # Airflow webserver — waits for airflow-init to complete before starting.
+  # ── Airflow webserver ──────────────────────────────────────────────────────
   airflow-webserver:
     build:
       context: .
@@ -212,7 +236,7 @@ services:
     restart: unless-stopped
     command: webserver
 
-  # Airflow scheduler — waits for DB init before starting.
+  # ── Airflow scheduler ──────────────────────────────────────────────────────
   airflow-scheduler:
     build:
       context: .
@@ -228,7 +252,59 @@ services:
     restart: unless-stopped
     command: scheduler
 
-# Volumes for persistence
+  # ── Apache Superset ────────────────────────────────────────────────────────
+  # Real-time dashboard layer that connects directly to Snowflake.
+  # Two-phase startup: superset-init bootstraps the DB + admin user once;
+  # superset runs the Gunicorn webserver afterwards.
+  superset-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: "${SUPERSET_SECRET_KEY}"
+      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://airflow:airflow@postgres:5432/superset"
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        superset db upgrade
+        superset fab create-admin \
+          --username admin \
+          --firstname Superset \
+          --lastname Admin \
+          --email admin@superset.com \
+          --password admin || true
+        superset init
+
+  superset:
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+    depends_on:
+      postgres:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully
+    environment:
+      SUPERSET_SECRET_KEY: "${SUPERSET_SECRET_KEY}"
+      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://airflow:airflow@postgres:5432/superset"
+      # Snowflake connection string exposed so dashboards can be auto-registered
+      SNOWFLAKE_SQLALCHEMY_URI: "snowflake://${SNOWFLAKE_USER}:${SNOWFLAKE_PASSWORD}@${SNOWFLAKE_ACCOUNT}/${SNOWFLAKE_DATABASE}/${SNOWFLAKE_SCHEMA}?warehouse=${SNOWFLAKE_WAREHOUSE}&role=${SNOWFLAKE_ROLE}"
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8088/health > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    command: superset run -p 8088 --with-threads --reload --debugger
+
+# ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   zookeeper_data:
   kafka_data:
