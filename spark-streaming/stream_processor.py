@@ -111,10 +111,13 @@ class RetailStreamProcessor:
         avro_payload = expr(
             "substring(value, 6, length(value) - 5)"
         )
+        # PERMISSIVE: malformed messages produce null rows instead of crashing the job.
+        # This handles stale non-Avro messages and unexpected wire-format changes gracefully.
+        # Null rows (decode failures) are filtered out before writing to Snowflake.
         decoded = df.select(
-            from_avro(avro_payload, RETAIL_AVRO_SCHEMA_STR).alias("data")
+            from_avro(avro_payload, RETAIL_AVRO_SCHEMA_STR, {"mode": "PERMISSIVE"}).alias("data")
         )
-        return decoded.select(
+        return decoded.filter(col("data").isNotNull()).select(
             col("data.transaction_id"),
             col("data.store_id"),
             col("data.product_id"),
@@ -177,6 +180,9 @@ class RetailStreamProcessor:
                 .option("kafka.bootstrap.servers", self.kafka_cfg.bootstrap_servers)
                 .option("subscribe", self.kafka_cfg.topic)
                 .option("startingOffsets", self.kafka_cfg.starting_offsets)
+                # Prevent job termination if Kafka offsets are reset (topic deletion/recreation
+                # or log compaction). Spark will skip missing offsets and continue.
+                .option("failOnDataLoss", "false")
                 .load()
         )
 
