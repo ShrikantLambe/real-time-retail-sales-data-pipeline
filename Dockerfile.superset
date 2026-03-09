@@ -2,9 +2,11 @@ FROM apache/superset:3.1.0
 
 USER root
 
-# snowflake-sqlalchemy is needed for the Snowflake database connection in Superset.
-# It depends on snowflake-connector-python which is pulled in automatically.
+# snowflake-sqlalchemy enables the Snowflake database connection in Superset.
+# Pin cryptography to satisfy apache-superset 3.1.0's constraint (<41.1.0)
+# — snowflake-sqlalchemy otherwise pulls in a newer version that conflicts.
 RUN pip install --no-cache-dir \
+    "cryptography>=41.0.2,<41.1.0" \
     snowflake-sqlalchemy==1.5.1
 
 USER superset
