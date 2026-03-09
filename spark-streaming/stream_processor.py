@@ -53,7 +53,7 @@ class SnowflakeConfig:
             'sfPassword': os.getenv('SNOWFLAKE_PASSWORD'),
             'sfDatabase': os.getenv('SNOWFLAKE_DATABASE', 'RETAIL_DB'),
             'sfSchema':   os.getenv('SNOWFLAKE_SCHEMA', 'STREAMING'),
-            'sfWarehouse':os.getenv('SNOWFLAKE_WAREHOUSE', 'RETAIL_WH'),
+            'sfWarehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'RETAIL_WH'),
             'sfRole':     os.getenv('SNOWFLAKE_ROLE', 'DATA_ENGINEER'),
         }
 
@@ -141,10 +141,10 @@ class RetailStreamProcessor:
         """
         agg = (
             df.groupBy(window(col("transaction_ts"), "5 minutes"), col("store_id"))
-              .agg(
-                  _sum(col("quantity") * col("price")).alias("total_revenue"),
-                  _sum("quantity").alias("total_quantity"),
-              )
+            .agg(
+                _sum(col("quantity") * col("price")).alias("total_revenue"),
+                _sum("quantity").alias("total_quantity"),
+            )
         )
         return agg.select(
             col("window.start").alias("window_start"),
@@ -174,16 +174,15 @@ class RetailStreamProcessor:
 
     def run(self) -> None:
         """Run the streaming job."""
+        # failOnDataLoss=false: skip missing offsets if topic is deleted/recreated or compacted.
         raw_stream = (
             self.spark.readStream
-                .format("kafka")
-                .option("kafka.bootstrap.servers", self.kafka_cfg.bootstrap_servers)
-                .option("subscribe", self.kafka_cfg.topic)
-                .option("startingOffsets", self.kafka_cfg.starting_offsets)
-                # Prevent job termination if Kafka offsets are reset (topic deletion/recreation
-                # or log compaction). Spark will skip missing offsets and continue.
-                .option("failOnDataLoss", "false")
-                .load()
+            .format("kafka")
+            .option("kafka.bootstrap.servers", self.kafka_cfg.bootstrap_servers)
+            .option("subscribe", self.kafka_cfg.topic)
+            .option("startingOffsets", self.kafka_cfg.starting_offsets)
+            .option("failOnDataLoss", "false")
+            .load()
         )
 
         parsed_stream = self.parse_and_cast(raw_stream)
@@ -192,12 +191,12 @@ class RetailStreamProcessor:
         def write_raw(batch_df: DataFrame, batch_id: int) -> None:
             self.write_to_snowflake(batch_df, "raw_retail_sales", batch_id)
 
-        raw_query = (
+        _raw_query = (  # noqa: F841 — kept alive; awaitAnyTermination monitors it
             deduped_stream.writeStream
-                .foreachBatch(write_raw)
-                .outputMode("append")
-                .option("checkpointLocation", f"{self.kafka_cfg.checkpoint_dir}/raw")
-                .start()
+            .foreachBatch(write_raw)
+            .outputMode("append")
+            .option("checkpointLocation", f"{self.kafka_cfg.checkpoint_dir}/raw")
+            .start()
         )
 
         agg_stream = self.aggregate_window(deduped_stream)
@@ -205,12 +204,12 @@ class RetailStreamProcessor:
         def write_agg(batch_df: DataFrame, batch_id: int) -> None:
             self.write_to_snowflake(batch_df, "agg_store_sales_5min", batch_id)
 
-        agg_query = (
+        _agg_query = (  # noqa: F841 — kept alive; awaitAnyTermination monitors it
             agg_stream.writeStream
-                .foreachBatch(write_agg)
-                .outputMode("append")
-                .option("checkpointLocation", f"{self.kafka_cfg.checkpoint_dir}/agg")
-                .start()
+            .foreachBatch(write_agg)
+            .outputMode("append")
+            .option("checkpointLocation", f"{self.kafka_cfg.checkpoint_dir}/agg")
+            .start()
         )
 
         # Both queries run concurrently. awaitAnyTermination() blocks until
