@@ -266,6 +266,9 @@ services:
     environment:
       SUPERSET_SECRET_KEY: "${SUPERSET_SECRET_KEY}"
       SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://airflow:airflow@postgres:5432/superset"
+      SUPERSET_CONFIG_PATH: /app/superset_config.py
+    volumes:
+      - ./superset_config.py:/app/superset_config.py:ro
     restart: "no"
     entrypoint: /bin/bash
     command:
@@ -277,7 +280,7 @@ services:
           --firstname Superset \
           --lastname Admin \
           --email admin@superset.com \
-          --password admin || true
+          --password admin123 || true
         superset init
 
   superset:
@@ -292,8 +295,11 @@ services:
     environment:
       SUPERSET_SECRET_KEY: "${SUPERSET_SECRET_KEY}"
       SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://airflow:airflow@postgres:5432/superset"
+      SUPERSET_CONFIG_PATH: /app/superset_config.py
       # Snowflake connection string exposed so dashboards can be auto-registered
       SNOWFLAKE_SQLALCHEMY_URI: "snowflake://${SNOWFLAKE_USER}:${SNOWFLAKE_PASSWORD}@${SNOWFLAKE_ACCOUNT}/${SNOWFLAKE_DATABASE}/${SNOWFLAKE_SCHEMA}?warehouse=${SNOWFLAKE_WAREHOUSE}&role=${SNOWFLAKE_ROLE}"
+    volumes:
+      - ./superset_config.py:/app/superset_config.py:ro
     ports:
       - "8088:8088"
     healthcheck:
