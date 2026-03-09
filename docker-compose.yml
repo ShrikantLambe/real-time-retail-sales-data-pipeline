@@ -302,7 +302,7 @@ services:
       timeout: 10s
       retries: 5
     restart: unless-stopped
-    command: superset run -p 8088 --with-threads --reload --debugger
+    command: superset run -p 8088 --host 0.0.0.0 --with-threads --reload --debugger
 
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
